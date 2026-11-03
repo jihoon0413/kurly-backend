@@ -1,5 +1,7 @@
 # market-kurly-clone — 백엔드
 
+https://github.com/5issue/total-backend
+
 마켓컬리를 참고한 **이커머스 + 풀필먼트** 백엔드. Gradle 멀티모듈 MSA로 8개 서비스를 운영한다.
 
 `Java 25` · `Spring Boot 4.1.0` · `Gradle 9.0.0` · `MySQL 8.4` / `PostgreSQL` · `RabbitMQ` · `Redis` · `EKS` + `ArgoCD`
