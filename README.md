@@ -1,218 +1,73 @@
-# market-kurly-clone — 백엔드
+# 🥦 Kurly Clone Backend (E-Commerce Backoffice & WMS)
+입고·출고·주문이 동시에 발생하는 물류(WMS) 환경에서 락-프리(Lock-Free) 동시성 제어로 재고 정합성을 확보하고, 추가 인프라 없이 기존 DB 내장 기능만으로 검색 성능을 극대화한 백엔드 시스템입니다.
 
-https://github.com/5issue/total-backend
+> - 진행 기간: 2026.08 ~ 2026.10 (3개월)
+> - 팀 구성 & 역할: 백엔드 3인 / 전체 22인 (상품 · 재고(WMS) 도메인 설계 및 성능 최적화 전담)
+> - 핵심 기술: Spring Boot, PostgreSQL, Redis, RabbitMQ, Lua Script, `pg_trgm` & GIN Index, TypeSpec, Flyway
+> - 핵심 검증: Redis Lua Script 기반 동시 100건 요청 초과 선점 `0건`(`p95 15ms`), `pg_trgm` + GIN 인덱스로 부분 일치 검색 속도 최대 약 `18배` 개선, TypeSpec 기반 API 명세 자동화 구축
+<br>
 
-마켓컬리를 참고한 **이커머스 + 풀필먼트** 백엔드. Gradle 멀티모듈 MSA로 8개 서비스를 운영한다.
+## 1. 분산 락 대신 Redis Lua Script로 구현한 락-프리(Lock-Free) 원자적 재고 선점
 
-`Java 25` · `Spring Boot 4.1.0` · `Gradle 9.0.0` · `MySQL 8.4` / `PostgreSQL` · `RabbitMQ` · `Redis` · `EKS` + `ArgoCD`
+### [문제 현상 및 배경]
+- 입고·출고·주문 트랜잭션이 동일한 상품 재고를 동시에 수정하는 물류(WMS) 도메인 특성상 동시성 이슈 발생 위험 존재.
+- RDBMS 비관적 락은 디스크 I/O 병목을 유발하고, Redisson 분산 락은 **락 획득·해제 과정의 반복적인 네트워크 왕복(RTT)과 애플리케이션 스레드 대기 오버헤드**로 리소스 부담과 지연 증가 우려.
 
----
+### [해결 전략 및 아키텍처]
+1. **분산 락 대신 Redis 단일 스레드 기반 락-프리(Lock-Free) 연산 채택**
+   - 별도의 락 획득·경합 비용 대신, 명령어를 순차적으로 실행하는 Redis의 단일 스레드 아키텍처를 활용해 락 없이(Lock-Free) 원자성을 보장하는 설계 채택.
+   <!-- 재고 선점 흐름(Hold -> Confirm / Cancel) 시퀀스 다이어그램 위치 -->
 
-## 빠르게 시작하기
+2. **Lua Script를 통한 3단계 재고 선점 로직 원자 실행**
+   - 아래 3단계 검증 및 갱신 로직을 단일 Lua Script로 묶어 Redis 엔진 내부에서 중간 개입 없이 원자적으로 실행.
+     1) **멱등성 검사**: 동일 주문의 중복 선점 요청 필터링
+     2) **가용 재고 검증**: 현재 가용 수량(`available_quantity`) 충족 여부 확인
+     3) **재고 선점(Hold)**: 선점 수량(`reserved_quantity`) 증가 처리
+   - 네트워크 왕복을 단 1회로 압축하여 락 경합과 스레드 대기 비용 원천 제거.
 
-```bash
-git clone <레포 주소> && cd total-backend
+3. **사후 정합성 보강 (복구 스케줄러 & 보상 트랜잭션)**
+   - 선점 이후 결제 실패·이탈이나 이벤트 유실로 인해 재고가 영구 점유(Ghost Reservation)되는 상황을 방지하기 위해, 만료 시간 기반 회수 스케줄러 및 보상 트랜잭션(`Cancel`)으로 최종 정합성 보강.
 
-cp .env.example .env          # 최초 1회
-docker compose up -d          # 공통 인프라 + 일부 서비스 DB
-docker compose ps             # 전부 healthy 확인
+### [검증 결과]
+- **동시성 및 정합성 검증**: 7개 핵심 경합 시나리오(동시 100건 요청 부하 환경)에서 **초과 선점 0건, 수량 정합성 100%** 달성.
+- **응답 지연 최적화**: 락 대기와 다중 네트워크 I/O를 제거하여 동시 요청 환경에서 **`p95` 응답 시간 15ms** 확보.
 
-./gradlew build               # 전체 빌드 + 테스트
-./gradlew :auth-service:bootRun
-```
+<br>
 
-| 주소 | 용도 |
-| --- | --- |
-| http://localhost:15672 | RabbitMQ 관리 UI (`guest` / `guest`) |
-| http://localhost:8080 | 통합 Swagger UI |
+## 2. 검색 엔진 도입 없이 `pg_trgm` + GIN 인덱스로 부분 일치 검색 최대 약 18배 개선
 
-> **`docker compose up -d`로 전부 뜨지 않는다.** 루트 compose에는 auth·payment·user·scm의 DB만
-> 있다. 나머지는 각 서비스가 자기 compose 파일을 갖는다 — [로컬 인프라](#로컬-인프라) 참조.
+### [문제 현상 및 배경]
+- 상품명 중간 키워드 매칭(`LIKE '%검색어%'`) 요구사항에서 일반 B-Tree 인덱스를 활용할 수 없어 매 조회마다 **Full Table Scan(`Seq Scan`)**에 의존.
+- 상품 데이터가 누적됨에 따라 조회 응답 시간이 선형적으로 증가할 위험 존재.
+- 서버 리소스와 운영 비용 제약으로 Elasticsearch 등 별도의 외부 검색 엔진 인프라 도입이 어려운 환경.
 
----
+### [해결 전략 및 아키텍처]
+1. **`pg_trgm` 확장 모듈을 활용한 Trigram 토큰화**
+   - 신규 인프라를 추가하는 대신 기존 PostgreSQL 내장 자원을 극대화하는 방향으로 의사결정.
+   - 문자열을 3글자 단위(Trigram)로 분해해 인덱싱하는 `pg_trgm` 확장을 활성화하여 중간 문자열 검색 기반 마련.
 
-## 서비스 구성
+2. **GIN(Generalized Inverted Index) 역색인 구조 구축**
+   - 다중 Trigram 토큰을 효율적으로 역색인할 수 있도록 상품명 컬럼에 GIN 인덱스를 생성하고, 부분 일치 검색 쿼리가 인덱스를 타도록 최적화.
+   <!-- EXPLAIN ANALYZE 실행 계획 비교(Seq Scan -> Bitmap Index Scan) 캡처 위치 -->
 
-| n | 서비스 | 역할 | 앱 | DB |
-| ---: | --- | --- | ---: | --- |
-| 1 | `auth-service` | 소셜 로그인, JWT 발급·검증, 세션, 관리자 인증 | 8081 | MySQL 3307 |
-| 2 | `order-service` | 장바구니, 주문, 취소·반품 | 8082 | MySQL 3308 |
-| 3 | `payment-service` | PG 연동, 결제 승인·취소, 아웃박스 | 8083 | MySQL 3309 |
-| 4 | `product-service` | 상품, 카테고리, 재고 | 8084 | PostgreSQL 5436 |
-| 5 | `wms-service` | 입고 검수·적치, 창고 재고 | 8085 | PostgreSQL 5437 |
-| 6 | `oms-service` | 주문 이행, 출고 지시, 배송 약속 | 8086 | PostgreSQL 5438 |
-| 7 | `scm-service` | 공급망 (골격만 구현됨) | 8087 | PostgreSQL 5439 |
-| 8 | `user-service` | 회원 프로필, 배송지 | 8088 | MySQL 3314 |
+### [검증 결과]
+- **실행 계획 전환**: 실데이터 10만 건 기준 `EXPLAIN ANALYZE` 분석 결과, `Seq Scan`에서 **`Bitmap Index Scan`으로 실행 계획 전환** 확인.
+- **조회 성능 향상**: 부분 일치 검색 쿼리 응답 속도를 **최대 약 18배 개선**하여, 별도 검색 엔진 없이도 데이터 증가에 관계없이 수 ms 단위의 안정적인 응답 확보.
 
-포트는 서비스 번호 `n`에 대해 앱 `8080+n`, MySQL `3306+n`, PostgreSQL `5432+n`이다.
-자세한 규칙은 [service-port-convention.md](docs/service-port-convention.md).
+<br>
 
-**`common`** 은 실행 서비스가 아니라 전 서비스가 의존하는 라이브러리다. 아래 참조.
+## 3. 협업 생산성 및 운영 안정성 개선
 
----
+### 1) TypeSpec 기반 API-First 설계 및 명세 자동화
+- **배경**: API-First 개발을 지향했으나 구현 변경 사항이 문서에 즉시 반영되지 않아 프론트엔드·백엔드 간 소통 비용이 반복됨. 이를 개인의 부주의가 아닌 **프로세스 부재의 문제**로 정의.
+- **해결**: **TypeSpec**을 단일 진실 공급원(SSOT)으로 도입하고 팀 내 적용 가이드를 배포했으며, `PR 머지 시 Notion API 문서에 최신 명세가 자동 동기화되는 CI 파이프라인` 구축.
+- **성과**: 개발 전 단계에서 명세 리뷰가 정착되어 설계 결함을 조기 발견했으며, 문서 수작업 제거 및 구조화된 명세를 AI 에이전트의 코드 생성·검증 보조에 활용.
 
-## common 모듈
+### 2) Flyway 기반 운영 DB 무중단 스키마 마이그레이션
+- **배경**: 배포 완료(`ddl-auto=validate`)된 운영 환경에 RabbitMQ 이벤트 발행을 위한 Outbox 테이블을 안전하게 추가해야 하는 상황.
+- **해결**: **Flyway**를 도입해 스키마 변경 이력을 버전 관리하고, 검증된 DDL 스크립트를 통해 운영 DB 스키마를 안전하게 확장.
 
-단순 유틸이 아니라 **Spring Boot 자동 구성 라이브러리**다. 여기에 전역 빈이나 핸들러를 추가하면
-`common/src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`
-에 **반드시 등록**해야 적용된다.
-
-| 구성 | 내용 |
-| --- | --- |
-| 인증 처리기 | JWT 검증 + 역할 인가. `kurly.security.enabled=true`인 서비스에서만 동작 |
-| 응답 규약 | `ApiResponse<T>` — `status`/`message`/`data`/`error`/`timestamp` |
-| 예외 처리 | `GlobalExceptionHandler` — 서비스마다 `@RestControllerAdvice`를 새로 만들지 않는다 |
-| 메시징 | RabbitMQ JSON `MessageConverter` |
-| 설정 가드 | `UnresolvedPlaceholderGuard` — 운영에서 환경변수가 빠지면 기동 전에 중단 |
-
-Spring Boot 4라 Jackson은 **Jackson 3**(`tools.jackson.databind.json.JsonMapper`)를 쓴다.
-`com.fasterxml.jackson.databind.ObjectMapper`가 아니다.
-
----
-
-## 인증·인가
-
-게이트웨이를 두지 않고 **각 서비스가 진입부**가 되어 스스로 JWT를 검증한다. 인증을 한곳에 모으면
-그 지점이 병목이 되고, 소유권 검사는 결국 각 서비스의 데이터를 봐야 하기 때문이다.
-
-```
-[클라이언트] ──access token──▶ [ALB] ──▶ [각 서비스]
-                                           ├ JWT 서명·만료 검증 (JWKS 공개키)
-                                           ├ 역할 인가 (user / admin)
-                                           └ 소유권 검사 (서비스 책임)
-```
-
-- 서명 **ES256**, 운영은 **KMS**로 서명해 개인키를 프로세스가 들고 있지 않는다
-- 공개키는 `GET /.well-known/jwks.json`으로 배포. 회전 중에는 키가 둘이므로 `kid`로 고른다
-- access 30분(관리자 15분) / refresh 14일. refresh는 **회전**하며 재사용이 감지되면 전 세션 폐기
-- refresh 토큰은 **RDB에 해시로** 저장한다. Redis는 캐시이지 인증 저장소가 아니다
-
-### 엔드포인트마다 애노테이션이 필수다
-
-```java
-@PublicApi        // 인증 불필요
-@Authenticated    // 로그인 필요
-@RequireRole(Role.ADMIN)
-```
-
-**하나라도 빠뜨리면 서버가 기동되지 않는다.** 인가 누락은 런타임에 오류 없이 그냥 열리므로,
-`HandlerAuthorizationAuditor`가 포트가 열리기 전에 중단시킨다. 메서드 표기가 클래스 표기보다 우선한다.
-
-인증 주체는 `@AuthPrincipal AuthenticatedPrincipal` 파라미터로 받는다. `ThreadLocal`은 쓰지 않는다.
-
-적용 절차는 [공통 인증처리기 적용가이드](docs/공통_인증처리기_적용가이드.md),
-규격은 [인증인가 설계서 v2.1](docs/인증인가_설계서_v2.1.md).
-
----
-
-## 로컬 인프라
-
-### 루트 compose — 공통 인프라 + 일부 DB
-
-```bash
-docker compose up -d        # RabbitMQ, Redis, Swagger UI, auth·payment·user·scm DB
-docker compose down         # -v 를 붙이면 볼륨까지 삭제된다
-```
-
-### 서비스별 compose — 나머지 DB
-
-```bash
-docker compose -f services/order-service/docker-compose.local.yml up -d
-docker compose -f services/oms-service/docker-compose.local.yml   up -d
-docker compose -f services/product-service/docker-compose.yml     up -d
-docker compose -f services/wms-service/docker-compose.yml         up -d
-```
-
-compose 프로젝트가 나뉘어 있어 **`docker compose down`은 루트 것만 내린다.** 전부 내리려면
-`-p <프로젝트명>`으로 각각 처리한다(`order-service`, `oms-service`, `product-service`, `wms-service`).
-
----
-
-## 개발
-
-```bash
-./gradlew build                      # 전체 빌드 + 테스트 + 커버리지 검증
-./gradlew :auth-service:build        # 모듈 경로는 services/ 없이 :서비스명
-./gradlew :auth-service:bootRun
-./gradlew test                       # 전체 테스트
-./gradlew :order-service:test --tests 'com.kurly.order.SomeTest'
-./gradlew :order-service:test --tests 'com.kurly.order.SomeTest.메서드명'
-```
-
-`settings.gradle`이 `services/*`를 최상위 이름으로 매핑하므로 Gradle 경로가 평평하다
-(`:services:auth-service`가 아니라 `:auth-service`).
-
-린터·포매터는 설정되어 있지 않다. 코드 스타일은 [팀컨벤션](docs/팀컨벤션-코드스타일.md)을 따른다.
-
-### 테스트 커버리지
-
-Jacoco 리포트는 전 모듈에서 생성되지만, **임계값 검증은 서비스별로 적용**한다. 테스트가 아직
-없는 서비스의 빌드를 깨뜨리지 않기 위해서다.
-
-| 모듈 | 게이트 |
-| --- | --- |
-| `auth` · `payment` · `user` | 라인 80% / 브랜치 80% |
-| `oms` | 70% / 70% |
-| `common` | 65% / 75% — 현재 수준을 지키는 래칫. 단계적으로 80%까지 올린다 |
-| 그 외 | 게이트 없음 |
-
-리포트는 `<모듈>/build/reports/jacoco/test/html/index.html`.
-
-### 일부 서비스의 통합 테스트는 기본적으로 건너뛴다
-
-실제 DB·외부 환경이 필요한 테스트는 환경변수 가드가 걸려 있다.
-
-```bash
-AUTH_INTEGRATION_TEST=true ./gradlew :auth-service:test
-```
-
----
-
-## API 규약
-
-모든 컨트롤러는 `ApiResponse<T>`로 감싼 응답을 돌려준다(UTC ISO-8601).
-
-```json
-{ "status": "SUCCESS", "message": "...", "data": { }, "error": null,
-  "timestamp": "2026-10-02T00:00:00Z" }
-```
-
-예외는 `BusinessException`을 상속하고 `ErrorCode`를 구현한 도메인별 enum으로 확장한다.
-공통 코드는 `GlobalErrorCode`(`COMMON400`, `COMMON401`, …). 인증·인가 실패는 401과 403을 구분하되
-**실패 사유를 과도하게 노출하지 않는다.**
-
-**내부 전용 경로는 `/internal/v1/...`** 로 통일한다. 인그레스가 `/internal/**` 접두어로 외부 접근을
-차단하므로, 중간에 `internal`이 들어간 경로(`/api/v1/internal/...`)는 **차단되지 않는다.**
-
----
-
-## 배포
-
-```
-develop에 push
-   → CI: 빌드·테스트 (서비스별 paths 필터)
-   → CD: 멀티 아키텍처 이미지 빌드 → ECR push
-       → total-k8s 레포의 이미지 태그 갱신 커밋
-           → ArgoCD가 감지해 자동 배포
-```
-
-- CI/CD는 `.github/workflows/{ci,cd}-<서비스>.yml`. `common`이나 빌드 스크립트가 바뀌면 함께 돈다
-- `pr-notify.yml`이 워크플로 완료를 받아 Discord로 알린다. **CI 워크플로 이름을 바꾸면 이 목록도 함께 고쳐야 한다**
-- 운영 설정은 환경변수로 주입한다. 빠지면 `UnresolvedPlaceholderGuard`가 기동을 중단시킨다
-
----
-
-## 서비스를 추가할 때
-
-함께 손봐야 하는 곳이다. 하나라도 빠지면 조용히 어긋난다.
-
-1. `settings.gradle`의 `serviceModules`
-2. [service-port-convention.md](docs/service-port-convention.md) 표
-3. `.github/workflows/ci-<서비스>.yml`, `cd-<서비스>.yml`
-4. `pr-notify.yml`의 `workflows` 목록
-5. DB가 필요하면 `docker-compose.yml` 또는 서비스별 compose
-
----
+<br>
 
 ## 문서
 
