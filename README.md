@@ -65,7 +65,7 @@
 ## 2. 검색 엔진 도입 없이 `pg_trgm` + GIN 인덱스로 부분 일치 검색 최대 약 18배 개선
 
 ### [문제 현상 및 배경]
-- 상품명 중간 키워드 매칭(`LIKE '%검색어%'`) 요구사항에서 일반 B-Tree 인덱스를 활용할 수 없어 매 조회마다 **Full Table Scan(`Seq Scan`)**에 의존.
+- 상품명 중간 키워드 매칭(`LIKE '%검색어%'`) 요구사항에서 일반 B-Tree 인덱스를 활용할 수 없어 매 조회마다 **Full Table Scan(`Seq Scan`)** 에 의존.
 - 상품 데이터가 누적됨에 따라 조회 응답 시간이 선형적으로 증가할 위험 존재.
 - 서버 리소스와 운영 비용 제약으로 Elasticsearch 등 별도의 외부 검색 엔진 인프라 도입이 어려운 환경.
 
@@ -75,12 +75,43 @@
    - 문자열을 3글자 단위(Trigram)로 분해해 인덱싱하는 `pg_trgm` 확장을 활성화하여 중간 문자열 검색 기반 마련.
 
 2. **GIN(Generalized Inverted Index) 역색인 구조 구축**
-   - 다중 Trigram 토큰을 효율적으로 역색인할 수 있도록 상품명 컬럼에 GIN 인덱스를 생성하고, 부분 일치 검색 쿼리가 인덱스를 타도록 최적화.
-   <!-- EXPLAIN ANALYZE 실행 계획 비교(Seq Scan -> Bitmap Index Scan) 캡처 위치 -->
+   - 다중 Trigram 토큰을 효율적으로 역색인할 수 있도록 상품명 컬럼에 GIN 인덱스를 생성하고, 부분 일치 검색 쿼리가 역색인을 타도록 최적화.
 
-### [검증 결과]
-- **실행 계획 전환**: 실데이터 10만 건 기준 `EXPLAIN ANALYZE` 분석 결과, `Seq Scan`에서 **`Bitmap Index Scan`으로 실행 계획 전환** 확인.
-- **조회 성능 향상**: 부분 일치 검색 쿼리 응답 속도를 **최대 약 18배 개선**하여, 별도 검색 엔진 없이도 데이터 증가에 관계없이 수 ms 단위의 안정적인 응답 확보.
+### [검증 결과 및 실행 계획 분석]
+실데이터 10만 건 환경에서 검색어의 길이와 구체성(선택도)을 달리한 3가지 케이스로 `EXPLAIN ANALYZE` 실행 계획 및 응답 시간을 비교 검증했습니다.
+<br><br>
+
+<img width="1850" height="810" alt="image" src="https://github.com/user-attachments/assets/7f3b5a83-bc38-4239-869d-0c2ac20e0aef" />
+
+
+- **실행 계획 전환**: 모든 부분 일치 검색 쿼리에서 테이블 전체를 읽던 `Seq Scan`이 **`Bitmap Index Scan` + `Bitmap Heap Scan`으로 전환**됨을 확인.
+- **조회 성능 향상 및 검색어 특성 분석**:
+  - 부분 일치 검색 쿼리 응답 속도를 **최대 약 18배 개선**하여 별도 검색 엔진 없이도 수 ms 단위의 안정적인 응답 확보.
+  - 특히 `'바나나'`처럼 짧고 보편적인 키워드보다 **`'제주 바나나'`처럼 더 길고 구체적인 검색어일수록 생성되는 Trigram 토큰 교집합이 많아져 인덱스 선택도(Selectivity)가 높아지고, 이에 따라 후보 행(Heap Block) 접근량이 크게 줄어들며 성능 개선 폭이 더욱 극대화**됨을 확인.
+
+#### 1) 인덱스 적용 전 (`Seq Scan` — 10만 건 전체 스캔)
+<div align="center">
+  <img width="1268" height="394" alt="적용 전 실행 계획 1" src="https://github.com/user-attachments/assets/c054e52b-6898-4e1c-8cf6-2c9185ea13c0" />
+  <br>
+  <br><br>
+  <img width="1270" height="326" alt="적용 전 실행 계획 2" src="https://github.com/user-attachments/assets/57cf9931-88db-4e28-9fbb-0b65f915ce12" />
+  <br>
+  <br><br>
+  <img width="1264" height="308" alt="적용 전 실행 계획 3"  src="https://github.com/user-attachments/assets/f9288c71-80a1-44b6-a9e3-6f279cad3071" />
+  <br>
+</div>
+
+#### 2) `pg_trgm` + GIN 인덱스 적용 후 (`Bitmap Index Scan` 전환)
+<div align="center">
+  <img width="1580" height="518" alt="적용 후 실행 계획 1" src="https://github.com/user-attachments/assets/aef3699f-afd6-4852-943c-6b0423ec261c" />
+  <br>
+  <br><br>
+  <img width="1572" height="510" alt="적용 후 실행 계획 2" src="https://github.com/user-attachments/assets/0e0c95d5-dd7a-4ca4-b2ee-00274e22b42d" />
+  <br>
+  <br><br>
+  <img width="1568" height="508" alt="적용 후 실행 계획 3" src="https://github.com/user-attachments/assets/809c9fe0-67db-46e6-819a-d401ce4636f2" />
+  <br>
+</div>
 
 <br>
 
@@ -101,7 +132,7 @@
 3. **CI 기반 Notion API 문서 자동 동기화 파이프라인**
    - PR 머지 시 변경된 TypeSpec 스키마를 파싱해 팀 Notion 명세 페이지에 자동 반영하는 CI 파이프라인을 구축함으로써, 별도 수작업 없이 문서의 최신성을 상시 보장.
 
-### [검증 및 개선 성과]
+### [개선 성과]
 - **스펙 불일치 차단 및 문서화 자동화**: 개발 전 AI 명세 검토부터 개발 후 CI 기반 자동 문서 갱신까지 하나의 흐름으로 연결하여, 수동 문서 갱신 비용을 제거하고 프론트-백엔드 간 스펙 불일치 원천 차단.
 - **AI 코드 생성 품질 및 생산성 향상**: 모호함이 제거된 최신 스키마를 AI 에이전트에 공급하여 오류 코드 생성을 방지하고, 표준화된 명세 기반의 DTO 및 비즈니스 로직 구현 속도 개선.
 - **병렬 개발 환경 확보**: 신뢰할 수 있는 최신 명세를 기준으로 백엔드 구현 완료 전에도 프론트엔드 Mocking 환경을 즉시 구축해 팀 단위 병렬 개발 실현.
